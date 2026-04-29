@@ -1,10 +1,11 @@
 """
-churn_model.py — Dynamic XGBoost / Logistic Regression churn prediction.
+churn_model.py — XGBoost churn prediction.
 
-Model selection:
-  ≥ 100 customers  →  XGBoost (Pre-Trained)           + real SHAP TreeExplainer
-  20–99 customers  →  Logistic Regression (Pre-Trained) + pseudo-SHAP (coef × value)
-  < 20 customers   →  HTTP 422 (insufficient data)
+Model is always trained / scored on the FULL historical dataset so churn
+probabilities are stable.  The optional start_date / end_date parameters
+only filter which customer rows are returned for *display* in the UI.
+Logistic Regression fallback is no longer needed because the full dataset
+always provides enough customers for XGBoost.
 
 Scaler:   models/rfm_scaler.pkl
 Features: Frequency, Monetary, CancellationRate, AOV, Lifespan
@@ -20,14 +21,10 @@ import shap
 import pandas as pd
 from fastapi import HTTPException
 
-from db import load_transactions
+from db import load_transactions_all
 
 # ─── Feature order must match training exactly ───────────────────────────────
 FEATURE_NAMES = ["Frequency", "Monetary", "CancellationRate", "AOV", "Lifespan"]
-
-# ─── Minimum customer thresholds ─────────────────────────────────────────────
-MIN_XGB = 100   # XGBoost needs enough rows for reliable tree splits
-MIN_LR  =  20   # Logistic Regression handles small samples well
 
 # ─── Load pre-trained artefacts once at import time ──────────────────────────
 try:
@@ -43,13 +40,6 @@ try:
 except Exception as _e:
     XGB_MODEL = None
     print(f"⚠️  XGBoost model not found: {_e}")
-
-try:
-    LR_MODEL = joblib.load("models/logistic_churn_model.pkl")
-    print("✅ Logistic Regression churn model loaded.")
-except Exception as _e:
-    LR_MODEL = None
-    print(f"⚠️  Logistic Regression model not found: {_e}")
 
 
 def _build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -76,51 +66,24 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     return agg[["card_no", "Frequency", "Monetary", "CancellationRate", "AOV", "Lifespan"]]
 
 
-def _select_model(n: int) -> tuple:
-    """
-    Dynamically pick the best available model based on customer count.
-    Returns (model, model_name, use_xgb, reason).
-    """
-    if n >= MIN_XGB and XGB_MODEL is not None:
-        return (XGB_MODEL,
-                "XGBoost (Pre-Trained)",
-                True,
-                f"XGBoost selected — {n} customers ≥ threshold of {MIN_XGB}")
-    if n >= MIN_LR and LR_MODEL is not None:
-        return (LR_MODEL,
-                "Logistic Regression (Pre-Trained)",
-                False,
-                f"Logistic Regression selected — {n} customers is below XGBoost threshold of {MIN_XGB}")
-    if n < MIN_LR:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Insufficient data: only {n} unique customers found. "
-                f"Minimum required: {MIN_LR} (Logistic Regression) "
-                f"or {MIN_XGB} (XGBoost). "
-                f"Please widen the date range."
-            ),
-        )
-    raise HTTPException(status_code=503, detail="No churn model is loaded.")
-
-
 def run_churn_prediction(merchant_id: int | None,
                          churn_days: int,
                          start_date: str | None,
                          end_date: str | None) -> dict:
     """
-    Predict customer churn with dynamic model selection:
-      ≥100 customers → XGBoost + real SHAP
-      20–99          → Logistic Regression + pseudo-SHAP
-      <20            → HTTP 422
+    Predict customer churn using XGBoost on the FULL historical dataset.
+    start_date / end_date only filter which predictions are returned for display.
     """
     if SCALER is None:
         raise HTTPException(status_code=503, detail="Churn scaler not loaded.")
+    if XGB_MODEL is None:
+        raise HTTPException(status_code=503, detail="XGBoost churn model not loaded.")
 
-    df = load_transactions(merchant_id, start_date, end_date)
+    # ── Always load ALL data for model scoring ───────────────────────────────
+    df = load_transactions_all(merchant_id)
     if df.empty:
         raise HTTPException(status_code=404,
-                            detail="No transactions found for the selected date range.")
+                            detail="No transactions found in the database.")
 
     df = df.dropna(subset=["card_no"])
 
@@ -134,60 +97,53 @@ def run_churn_prediction(merchant_id: int | None,
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"Date range too narrow for churn prediction. "
-                    f"A minimum span of {churn_days} days is needed. "
-                    f"Please widen the date range or reduce the churn window."
+                    f"Not enough history for churn prediction. "
+                    f"Database needs at least {churn_days} days of transactions."
                 ),
             )
 
-        # 1. Feature engineering
+        # 1. Feature engineering on all customers
         rfm = _build_features(historical)
         n   = len(rfm)
+        if n < 1:
+            raise HTTPException(status_code=422, detail="No customers found after feature engineering.")
 
-        # 2. Dynamic model selection
-        model, model_name, use_xgb, model_reason = _select_model(n)
-        print(f"ℹ️  {model_reason}")
+        model_name   = "XGBoost (Pre-Trained)"
+        model_reason = f"XGBoost selected — full dataset ({n} customers)"
 
-        # 3. Churn label: not seen after cutoff = churned
+        # 2. Churn label: not seen after cutoff = churned
         active_customers = set(future["card_no"].unique())
         rfm["isChurned"] = (~rfm["card_no"].isin(active_customers)).astype(bool)
 
-        # 4. Scale + predict (inference only — no .fit())
+        # 3. Scale + predict (inference only — no .fit())
         X        = rfm[FEATURE_NAMES].copy()
         X_scaled = SCALER.transform(X)
-        rfm["churnProbability"] = model.predict_proba(X_scaled)[:, 1]
+        rfm["churnProbability"] = XGB_MODEL.predict_proba(X_scaled)[:, 1]
 
-        # 5. SHAP values
+        # 4. SHAP values
         shap_base_value   = 0.0
         global_importance = {}
         try:
-            if use_xgb:
-                # Real SHAP via TreeExplainer
-                explainer     = shap.TreeExplainer(model)
-                shap_values   = explainer.shap_values(X_scaled)
-                shap_base_value   = round(float(explainer.expected_value), 4)
-                global_importance = {
-                    name: round(float(np.abs(shap_values[:, i]).mean()), 4)
-                    for i, name in enumerate(FEATURE_NAMES)
-                }
-                for i, fname in enumerate(FEATURE_NAMES):
-                    rfm[f"shap_{fname}"] = shap_values[:, i]
-            else:
-                # Pseudo-SHAP via LR coefficients
-                coefs             = model.coef_[0]
-                shap_base_value   = round(float(model.intercept_[0]), 4)
-                global_importance = {
-                    name: round(float(abs(val)), 4)
-                    for name, val in zip(FEATURE_NAMES, coefs)
-                }
-                for i, fname in enumerate(FEATURE_NAMES):
-                    rfm[f"shap_{fname}"] = X_scaled[:, i] * coefs[i]
+            explainer         = shap.TreeExplainer(XGB_MODEL)
+            shap_values       = explainer.shap_values(X_scaled)
+            shap_base_value   = round(float(explainer.expected_value), 4)
+            global_importance = {
+                name: round(float(np.abs(shap_values[:, i]).mean()), 4)
+                for i, name in enumerate(FEATURE_NAMES)
+            }
+            for i, fname in enumerate(FEATURE_NAMES):
+                rfm[f"shap_{fname}"] = shap_values[:, i]
         except Exception as shap_err:
             print(f"⚠️  SHAP computation failed: {shap_err}")
 
-        # 6. Build response list
-        predictions = []
-        shap_cols   = [c for c in rfm.columns if c.startswith("shap_")]
+        # 5. Attach last-seen date for display filtering
+        last_seen = df.groupby("card_no")["txn_date"].max().reset_index()
+        last_seen.columns = ["card_no", "lastSeen"]
+        rfm = rfm.merge(last_seen, on="card_no", how="left")
+
+        # 6. Build full predictions list
+        shap_cols    = [c for c in rfm.columns if c.startswith("shap_")]
+        predictions_all = []
         for _, row in rfm.iterrows():
             pred = {
                 "cardNo":           row["card_no"],
@@ -198,23 +154,36 @@ def run_churn_prediction(merchant_id: int | None,
                 "lifespan":         int(row["Lifespan"]),
                 "churnProbability": round(float(row["churnProbability"]), 4),
                 "isChurned":        bool(row["isChurned"]),
+                "lastSeen":         row["lastSeen"].date().isoformat() if pd.notna(row["lastSeen"]) else None,
             }
             if shap_cols:
                 pred["shapBreakdown"] = {
                     col.replace("shap_", ""): round(float(row[col]), 4)
                     for col in shap_cols
                 }
-            predictions.append(pred)
+            predictions_all.append(pred)
+
+        # 7. Apply date filter for display only
+        predictions = predictions_all
+        if start_date:
+            predictions = [p for p in predictions if p["lastSeen"] and p["lastSeen"] >= start_date]
+        if end_date:
+            predictions = [p for p in predictions if p["lastSeen"] and p["lastSeen"] <= end_date]
 
         predictions.sort(key=lambda p: p["churnProbability"], reverse=True)
 
-        high_risk          = sum(1 for p in predictions if p["churnProbability"] > 0.7)
-        predicted_churners = sum(1 for p in predictions if p["churnProbability"] > 0.5)
-        churn_rate         = round((predicted_churners / len(predictions)) * 100, 2) if predictions else 0
+        # 8. Summary stats always based on full dataset
+        high_risk          = sum(1 for p in predictions_all if p["churnProbability"] > 0.7)
+        predicted_churners = sum(1 for p in predictions_all if p["churnProbability"] > 0.5)
+        churn_rate         = round((predicted_churners / len(predictions_all)) * 100, 2) if predictions_all else 0
+
+        db_min = df["txn_date"].min().date().isoformat()
+        db_max = df["txn_date"].max().date().isoformat()
 
         return {
             "predictions":             predictions,
             "totalCustomers":          n,
+            "displayCustomers":        len(predictions),
             "highRiskCount":           high_risk,
             "churnRate":               churn_rate,
             "churnDays":               churn_days,
@@ -222,6 +191,7 @@ def run_churn_prediction(merchant_id: int | None,
             "shapBaseValue":           shap_base_value,
             "modelUsed":               model_name,
             "modelSelectedReason":     model_reason,
+            "dateRange":               {"from": db_min, "to": db_max},
         }
 
     except HTTPException:
@@ -229,5 +199,5 @@ def run_churn_prediction(merchant_id: int | None,
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Churn prediction failed: {exc}. Try widening the date range (churn window: {churn_days} days).",
+            detail=f"Churn prediction failed: {exc}.",
         ) from exc
